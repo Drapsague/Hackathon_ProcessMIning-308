@@ -1,0 +1,10 @@
+pandas>=2.1
+numpy>=1.26
+openpyxl>=3.1
+streamlit>=1.36
+altair>=5
+requests>=2.31
+groq>=0.9
+python-dotenv>=1.0
+# uniquement pour regénérer data/airplus_787.glb depuis le STEP
+# cadquery-ocp>=7.7

@@ -1,0 +1,57 @@
+etape,page_notice,section,liste_pieces,note
+1,6,Train avant,oui,Axe et roue du train avant
+2,7,Fuselage et électronique,oui,Boîtier électronique câblé
+3,7,Fuselage et électronique,oui,Demi-fuselage et support
+4,8,Fuselage et électronique,oui,Boîtier intégré au fuselage
+5,9,Fuselage et électronique,oui,Visserie partie basse
+6,9,Fuselage central,oui,
+7,10,Fuselage central,oui,
+8,10,Fuselage central,oui,
+9,11,Fuselage central,oui,
+10,12,Queue,oui,Plaque de dérive
+11,12,Queue,oui,
+12,12,Queue,oui,
+13,13,Queue,oui,Cône arrière
+14,13,Queue,oui,
+15,14,Queue,oui,
+16,14,Queue,oui,
+17,15,Queue,oui,Queue sur fuselage
+18,16,Queue,oui,Dérive sur fuselage
+19,17,Cockpit,oui,Deux demi-nez
+20,18,Aile gauche,oui,Vignette avion : côté gauche
+21,18,Aile gauche,oui,
+22,19,Aile gauche,oui,
+23,19,Aile gauche,oui,
+24,20,Aile gauche,oui,
+25,20,Aile gauche,oui,
+26,21,Aile gauche,oui,
+27,21,Réacteurs,oui,Sous-ensemble répété x4
+28,22,Réacteur aile gauche,oui,
+29,23,Réacteur aile gauche,oui,
+30,24,Réacteur aile gauche,oui,
+31,25,Train gauche,oui,Roues x2
+32,25,Train gauche,oui,
+33,25,Train gauche,oui,
+34,25,Train gauche,oui,
+35,26,Jonction aile gauche,oui,Aile et train sur fuselage
+36,27,Aile droite,oui,Vignette avion : côté droit
+37,27,Aile droite,oui,
+38,28,Aile droite,oui,
+39,28,Aile droite,oui,
+40,29,Aile droite,oui,
+41,29,Aile droite,oui,
+42,30,Aile droite,oui,
+43,31,Réacteur aile droite,oui,
+44,32,Réacteur aile droite,oui,
+45,33,Réacteur aile droite,oui,
+46,34,Train droit,oui,
+47,34,Train droit,oui,
+48,34,Train droit,oui,
+49,35,Jonction aile droite,oui,Aile et train sur fuselage
+50,36,Bouts d'ailes,oui,
+51,37,Faisceaux électriques,non,Encadré pièces vide : câblage seul
+52,38,Lumières bouts d'ailes,oui,
+53,39,Marquage,oui,Autocollant cockpit
+54,40,Marquage,oui,Autocollants réacteurs
+55,41,Marquage,oui,Autocollants fuselage
+56,42,Marquage,oui,Autocollants fuselage côté opposé
