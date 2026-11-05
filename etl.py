@@ -7,10 +7,7 @@ de citer ses sources.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import hmac
 import json
-import os
 import re
 import struct
 import unicodedata
@@ -21,9 +18,10 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).parent / "data"
 
-MES_FILE = "MES_Extraction_FR.xlsx"
-PLM_FILE = "PLM_DataSet_FR.xlsx"
-ERP_FILE = "ERP_Equipes Airplus_FR.xlsx"
+# Extractions en anglais (UK) si elles sont présentes dans data/, sinon les françaises (FR)
+MES_FILES = ["MES_Extraction_UK.xlsx", "MES_Extraction_FR.xlsx"]
+PLM_FILES = ["PLM_DataSet_UK.xlsx", "PLM_DataSet_FR.xlsx"]
+ERP_FILES = ["ERP_Equipes_Airplus_UK.xlsx", "ERP_Equipes Airplus_UK.xlsx", "ERP_Equipes Airplus_FR.xlsx"]
 NOTICE_STEPS_FILE = "ref_process_notice.csv"
 NOTICE_INVENTORY_FILE = "inventaire_notice.csv"
 CAD_FILE = "airplus_787.glb"
@@ -32,6 +30,22 @@ SHIFT_START = dt.time(8, 0)
 SHIFT_END = dt.time(17, 0)
 
 PART_CODE = re.compile(r"\b[A-D]\d{3}\b")
+
+
+def _source(data_dir: Path, names: list[str]) -> Path:
+    for n in names:
+        if (data_dir / n).exists():
+            return data_dir / n
+    raise FileNotFoundError(f"Aucun de ces fichiers dans {data_dir} : {', '.join(names)}")
+
+
+def _col(df: pd.DataFrame, *names: str) -> pd.Series:
+    """Colonne d'après son nom FR ou UK (les en-têtes UK ont parfois des espaces en trop)."""
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    for n in names:
+        if n.strip().lower() in cols:
+            return df[cols[n.strip().lower()]]
+    raise KeyError(f"Colonne introuvable : {' / '.join(names)}")
 
 
 def strip_accents(text: str) -> str:
@@ -52,17 +66,21 @@ def to_minutes(value) -> float:
 
 # Familles d'aléas. L'ordre compte : la première règle qui matche gagne.
 ALEA_FAMILIES = [
-    ("MAR", "Marquage et finition", ["marquage", "impression", "etiquette", "sticker", "adherence"]),
-    ("ELE", "Électrique", ["electrique", "connectique"]),
-    ("ENV", "Environnement atelier", ["ventilation", "temperature", "contamination", "pression", "thermique"]),
-    ("SIS", "Systèmes d'information et automatismes",
+    ("MAR", "Marking and finishing", ["marquage", "impression", "etiquette", "sticker", "adherence",
+                                      "marking", "print", "label", "adhesion"]),
+    ("ELE", "Electrical", ["electrique", "connectique", "electric"]),
+    ("ENV", "Shop-floor environment", ["ventilation", "temperature", "contamination", "pression", "thermique",
+                                       "pressure", "thermal"]),
+    ("SIS", "IT systems and automation",
      ["automatis", "logiciel", "robot", "reseau", "synchronisation", "communication", "tracabilite",
-      "referencement", "protocole"]),
-    ("QUA", "Contrôle qualité et métrologie", ["controle", "calibration", "etalonnage", "derive"]),
-    ("OUT", "Outillage et usure", ["outillage", "usure", "gabarit"]),
-    ("LOG", "Logistique et manutention", ["manutention", "transport"]),
+      "referencement", "protocole", "automat", "software", "network", "synchroni", "traceability", "reference",
+      "protocol"]),
+    ("QUA", "Quality control and metrology", ["controle", "calibration", "etalonnage", "derive", "control",
+                                              "drift"]),
+    ("OUT", "Tooling and wear", ["outillage", "usure", "gabarit", "tool", "wear", "gauge"]),
+    ("LOG", "Logistics and handling", ["manutention", "transport", "handling"]),
 ]
-FAMILY_LABELS = {code: label for code, label, _ in ALEA_FAMILIES} | {"MEC": "Machines et équipements"}
+FAMILY_LABELS = {code: label for code, label, _ in ALEA_FAMILIES} | {"MEC": "Machines and equipment"}
 
 
 def alea_family(text: str) -> str:
@@ -74,29 +92,36 @@ def alea_family(text: str) -> str:
 
 
 def load_mes(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    raw = pd.read_excel(data_dir / MES_FILE)
+    raw = pd.read_excel(_source(data_dir, MES_FILES))
+    c = {k: _col(raw, *n) for k, n in {
+        "poste": ("Poste", "Workstation"), "nom": ("Nom", "Name"), "n": ("Nombre pièces", "Quantity"),
+        "ref": ("Référence", "Part Reference"), "prevu": ("Temps Prévu", "Planned Time"), "date": ("Date",),
+        "debut": ("Heure Début", "Start Time"), "fin": ("Heure Fin", "End Time"), "reel": ("Temps Réel", "Actual Time"),
+        "alea": ("Aléas Industriels", "Industrial Issues"), "cause": ("Cause Potentielle", "Potential Cause"),
+    }.items()}
     rows = []
-    for i, r in raw.iterrows():
+    for i in range(len(raw)):
+        r = {k: v.iat[i] for k, v in c.items()}
         line = i + 2  # ligne 1 = en-tête Excel
-        day = pd.Timestamp(r["Date"]).normalize()
-        start = day + pd.Timedelta(minutes=to_minutes(r["Heure Début"]))
-        end_declared = day + pd.Timedelta(minutes=to_minutes(r["Heure Fin"]))
-        refs_raw = r["Référence"]
+        day = pd.Timestamp(r["date"]).normalize()
+        start = day + pd.Timedelta(minutes=to_minutes(r["debut"]))
+        end_declared = day + pd.Timedelta(minutes=to_minutes(r["fin"]))
+        refs_raw = r["ref"]
         refs = [] if pd.isna(refs_raw) else [x.strip() for x in str(refs_raw).split(";") if x.strip()]
-        planned = to_minutes(r["Temps Prévu"])
-        real = to_minutes(r["Temps Réel"])
+        planned = to_minutes(r["prevu"])
+        real = to_minutes(r["reel"])
         rows.append({
-            "poste": int(r["Poste"]),
-            "operation": str(r["Nom"]).strip(),
-            "n_pieces": int(r["Nombre pièces"]),
+            "poste": int(r["poste"]),
+            "operation": str(r["nom"]).strip(),
+            "n_pieces": int(r["n"]),
             "refs": refs,
             "planned_min": planned,
             "real_min": real,
             "start": start,
             "end_declared": end_declared,
             "end_from_duration": start + pd.Timedelta(minutes=real),
-            "alea": str(r["Aléas Industriels"]).strip(),
-            "cause": str(r["Cause Potentielle"]).strip(),
+            "alea": str(r["alea"]).strip(),
+            "cause": str(r["cause"]).strip(),
             "mes_line": line,
             "evidence": f"MES:L{line}",
         })
@@ -109,6 +134,11 @@ def load_mes(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     return mes
 
 
+# valeurs catégorielles des fichiers sources, affichées en anglais
+CRITICALITY_EN = {"Critique": "Critical", "Haute": "High", "Moyenne": "Medium", "Basse": "Low"}
+LEVEL_EN = {"Débutant": "Beginner", "Confirmé": "Experienced", "Expert": "Expert"}  # libellés du fichier UK
+
+
 def _parse_delay(text) -> tuple[float, float]:
     nums = [float(n) for n in re.findall(r"\d+", str(text))]
     if not nums:
@@ -117,25 +147,34 @@ def _parse_delay(text) -> tuple[float, float]:
 
 
 def load_plm(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    raw = pd.read_excel(data_dir / PLM_FILE, sheet_name="Sheet1")
+    raw = pd.read_excel(_source(data_dir, PLM_FILES), sheet_name=0)  # Sheet1 (FR) ou PLM_DATA (UK)
+    c = {k: _col(raw, *n) for k, n in {
+        "code": ("Code / Référence",), "des": ("Désignation", "Part Description"),
+        "qty": ("Quantité", "Quantity Required"), "sup": ("Fournisseur", "Supplier Name"),
+        "lead": ("Délai Approvisionnement", "Procurement Lead Time (days", "Procurement Lead Time (days)"),
+        "crit": ("Criticité", "Criticality Level"), "mass": ("Masse (kg)", "Mass (kg)"),
+        "cost": ("Coût achat pièce (€)", "Purchase Cost per Unit (€)"), "cad": ("Temps CAO (h)", "CAD Design Hours"),
+    }.items()}
     rows = []
-    for i, r in raw.iterrows():
-        code = str(r["Code / Référence"]).strip()
+    for i in range(len(raw)):
+        r = {k: v.iat[i] for k, v in c.items()}
+        code = str(r["code"]).strip()
         if not PART_CODE.fullmatch(code):
             continue
-        dmin, dmax = _parse_delay(r["Délai Approvisionnement"])
+        dmin, dmax = _parse_delay(r["lead"])
+        crit = str(r["crit"]).strip()
         rows.append({
             "code": code,
-            "designation": str(r["Désignation"]).strip(),
-            "qty_bom": int(r["Quantité"]),
-            "supplier": str(r["Fournisseur"]).strip(),
-            "lead_time": str(r["Délai Approvisionnement"]).strip(),
+            "designation": str(r["des"]).strip(),
+            "qty_bom": int(r["qty"]),
+            "supplier": str(r["sup"]).strip(),
+            "lead_time": str(r["lead"]).strip().replace("jours", "days").replace("jour", "day"),
             "lead_min_days": dmin,
             "lead_max_days": dmax,
-            "criticality": str(r["Criticité"]).strip(),
-            "mass_kg": float(r["Masse (kg)"]),
-            "unit_cost_eur": float(r["Coût achat pièce (€)"]),
-            "cad_hours": float(r["Temps CAO (h)"]),
+            "criticality": CRITICALITY_EN.get(crit, crit),
+            "mass_kg": float(r["mass"]),
+            "unit_cost_eur": float(r["cost"]),
+            "cad_hours": float(r["cad"]),
             "plm_line": i + 2,
             "evidence": f"PLM:{code}",
         })
@@ -144,7 +183,7 @@ def load_plm(data_dir: Path = DATA_DIR) -> pd.DataFrame:
 
 def plm_second_sheet_noise(data_dir: Path = DATA_DIR) -> list[dict]:
     """Lignes de l'onglet Feuil1 qui ne sont pas des références pièce (texte parasite)."""
-    raw = pd.read_excel(data_dir / PLM_FILE, sheet_name="Feuil1", header=None)
+    raw = pd.read_excel(_source(data_dir, PLM_FILES), sheet_name="Feuil1", header=None)
     noise = []
     for i, val in raw[0].items():
         if pd.isna(val) or i == 0:
@@ -155,31 +194,25 @@ def plm_second_sheet_noise(data_dir: Path = DATA_DIR) -> list[dict]:
     return noise
 
 
-# Données ERP : on ne garde jamais les identifiants directs hors de ce module.
-ERP_DIRECT_IDENTIFIERS = ["Prénom", "Nom", "Commentaire de Carrière"]
+# Données ERP : le matricule est conservé, les noms, prénoms et commentaires ne sont jamais chargés.
+ERP_DIRECT_IDENTIFIERS = ["Prénom", "Nom", "Commentaire de Carrière", "First Name", "Last Name", "Career Remarks"]
 ERP_QUASI_IDENTIFIERS = ["poste", "age_band", "qualification", "level"]
 
 
-def pseudonym(matricule: str, salt: str) -> str:
-    digest = hmac.new(salt.encode(), matricule.encode(), hashlib.sha256).hexdigest()
-    return f"OP-{digest[:6].upper()}"
-
-
-def load_erp_pseudonymized(data_dir: Path = DATA_DIR, salt: str | None = None) -> pd.DataFrame:
-    """Pseudonymisation à la lecture : HMAC du matricule, suppression nom/prénom/commentaire,
-    âge passé en tranche de 10 ans. La clé (AIRPLUS_SALT) reste hors du dépôt."""
-    salt = salt or os.environ.get("AIRPLUS_SALT", "change-me-before-demo")
-    raw = pd.read_excel(data_dir / ERP_FILE)
+def load_erp(data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    """Matricule ERP tel quel ; nom, prénom et commentaire de carrière écartés, âge en tranche de 10 ans."""
+    raw = pd.read_excel(_source(data_dir, ERP_FILES))
+    age = _col(raw, "Âge", "Age")
     out = pd.DataFrame({
-        "operator_id": raw["Matricule"].astype(str).map(lambda m: pseudonym(m, salt)),
-        "poste": raw["Poste de montage"].astype(str).str.extract(r"(\d+)")[0].astype(int),
-        "age_band": (raw["Âge"] // 10 * 10).astype(int).astype(str) + "-" + (raw["Âge"] // 10 * 10 + 9).astype(int).astype(str),
-        "qualification": raw["Qualification"].astype(str),
-        "level": raw["Niveau d'expérience"].astype(str),
-        "skills": raw["Compétences"].astype(str),
-        "certifications": raw["Habilitations"].astype(str),
-        "hourly_cost_eur": raw["Coût horaire (€)"].astype(float),
-        "rotation": raw["Rotation"].astype(str),
+        "operator_id": _col(raw, "Matricule", "Employee ID").astype(str).str.strip(),
+        "poste": _col(raw, "Poste de montage", "Assembly Station").astype(str).str.extract(r"(\d+)")[0].astype(int),
+        "age_band": (age // 10 * 10).astype(int).astype(str) + "-" + (age // 10 * 10 + 9).astype(int).astype(str),
+        "qualification": _col(raw, "Qualification").astype(str),
+        "level": _col(raw, "Niveau d'expérience", "Experience Level").astype(str).map(lambda v: LEVEL_EN.get(v, v)),
+        "skills": _col(raw, "Compétences", "Skills and Competencies").astype(str),
+        "certifications": _col(raw, "Habilitations", "Certifications").astype(str),
+        "hourly_cost_eur": _col(raw, "Coût horaire (€)", "Hourly Rate (€)").astype(float),
+        "rotation": _col(raw, "Rotation", "Shift Rotation").astype(str),
     })
     out["erp_line"] = range(2, len(out) + 2)
     out["evidence"] = "ERP:L" + out["erp_line"].astype(str)
@@ -255,71 +288,71 @@ def quality_checks(mes, plm, notice_steps, notice_inv, bom, plm_noise) -> list[F
     trunc = mes[mes["truncated"]]
     lost = (trunc["end_from_duration"] - trunc["end_declared"]).dt.total_seconds().sum() / 60
     findings.append(Finding(
-        "DQ-01", "Opérations clôturées d'office à 17:00",
-        f"Postes {', '.join(map(str, trunc['poste']))} : l'heure de fin vaut 17:00 alors que début + temps réel "
-        f"dépasse. {lost:.0f} minutes de travail déclaré ne sont placées nulle part dans le temps.",
+        "DQ-01", "Operations force-closed at 17:00",
+        f"Stations {', '.join(map(str, trunc['poste']))}: the end time is 17:00 although start + actual time goes "
+        f"beyond it. {lost:.0f} minutes of declared work are not placed anywhere in time.",
         "haute", trunc["evidence"].tolist(), ["heure de fin", "temps de fin de poste"]))
 
     no_ref = mes[mes["refs"].map(len) == 0]
     step51 = notice_steps[notice_steps["liste_pieces"] == "non"]
     findings.append(Finding(
-        "DQ-02", "Opération sans référence pièce",
-        f"Poste {', '.join(map(str, no_ref['poste']))} sans pièce dans le MES. La notice (étape "
-        f"{', '.join(map(str, step51['etape']))}) n'a pas non plus de liste de pièces : c'est une étape de "
-        "câblage, pas une erreur de saisie.",
+        "DQ-02", "Operation without a part reference",
+        f"Station {', '.join(map(str, no_ref['poste']))} has no part in the MES. The manual (step "
+        f"{', '.join(map(str, step51['etape']))}) has no parts list either: it is a wiring step, not a data "
+        "entry error.",
         "info", no_ref["evidence"].tolist() + step51["evidence"].tolist()))
 
     gaps = bom[(bom["plm"].notna()) & (bom["mes_vs_plm"] != 0) & (bom["mes"] > 0)]
     findings.append(Finding(
-        "DQ-03", "Consommation MES différente de la nomenclature",
-        f"{len(gaps)} références : " + "; ".join(
-            f"{r.code} {int(r.plm)} prévu / {r.mes} consommé" for r in gaps.itertuples()) +
-        ". Le MES liste une référence à chaque usage : on ne sait pas s'il s'agit d'unités consommées "
-        "ou de passages.",
+        "DQ-03", "MES consumption differs from the bill of materials",
+        f"{len(gaps)} references: " + "; ".join(
+            f"{r.code} {int(r.plm)} planned / {r.mes} consumed" for r in gaps.itertuples()) +
+        ". The MES lists a reference at each use: it is unclear whether these are consumed units or "
+        "passes.",
         "haute", [f"PLM:{c}" for c in gaps["code"]], ["consommation réelle de pièces"]))
 
     never = bom[(bom["plm"].notna()) & (bom["mes"] == 0)]
     findings.append(Finding(
-        "DQ-04", "Références de la nomenclature jamais consommées",
-        "Jamais vues dans le MES : " + ", ".join(f"{r.code} ({r.designation})" for r in never.itertuples()) +
-        ". D145 (queue arrière gauche) est consommée deux fois et D144 (queue arrière droite) jamais : "
-        "erreur de référence probable sur la queue.",
+        "DQ-04", "Bill of materials references never consumed",
+        "Never seen in the MES: " + ", ".join(f"{r.code} ({r.designation})" for r in never.itertuples()) +
+        ". D145 (left rear tail) is consumed twice and D144 (right rear tail) never: likely reference error "
+        "on the tail.",
         "haute", [f"PLM:{c}" for c in never["code"]]))
 
     cad_issue = bom[(bom["code"].isin(["D144", "D145"]))]
     if cad_issue["cad"].notna().any():
         findings.append(Finding(
-            "DQ-05", "La queue arrière diffère selon les systèmes",
-            "Notice et PLM : D144 x1 et D145 x1. MES : D145 x" +
-            str(int(cad_issue.set_index('code').loc['D145', 'mes'])) + ", D144 x0. Maquette 3D : D144 x" +
+            "DQ-05", "The rear tail differs between systems",
+            "Manual and PLM: D144 x1 and D145 x1. MES: D145 x" +
+            str(int(cad_issue.set_index('code').loc['D145', 'mes'])) + ", D144 x0. 3D model: D144 x" +
             str(int(cad_issue.set_index('code').loc['D144', 'cad'])) + ", D145 x" +
-            str(int(cad_issue.set_index('code').loc['D145', 'cad'])) + ". Trois systèmes, trois versions.",
+            str(int(cad_issue.set_index('code').loc['D145', 'cad'])) + ". Three systems, three versions.",
             "haute", ["PLM:D144", "PLM:D145", "NOTICE:p43", "CAD:D144"]))
 
     if "C994" in set(notice_inv["code"]) and "C984" in set(plm["code"]):
         findings.append(Finding(
-            "DQ-06", "Code du tournevis différent entre notice et PLM",
-            "La notice référence le tournevis C994, le PLM C984. Outils (C984, C993) et planche "
-            "d'autocollants (C995) sont gérés comme des pièces dans la nomenclature.",
+            "DQ-06", "Screwdriver code differs between manual and PLM",
+            "The manual references screwdriver C994, the PLM C984. Tools (C984, C993) and the sticker "
+            "sheet (C995) are managed as parts in the bill of materials.",
             "moyenne", ["NOTICE:p43", "PLM:C984", "PLM:C993"]))
 
     if plm_noise:
         findings.append(Finding(
-            "DQ-07", "Texte parasite dans le PLM",
-            f"L'onglet Feuil1 contient {len(plm_noise)} lignes qui ne sont pas des pièces, dont « "
-            f"{plm_noise[-1]['text'][:80]} » : reste d'une génération par IA non nettoyée.",
+            "DQ-07", "Stray text in the PLM",
+            f"Sheet Feuil1 contains {len(plm_noise)} rows that are not parts, including \""
+            f"{plm_noise[-1]['text'][:80]}\": leftover from an uncleaned AI generation.",
             "moyenne", [f"PLM-F1:L{n['line']}" for n in plm_noise[:3]]))
 
     findings.append(Finding(
-        "DQ-08", "Données manifestement synthétiques",
-        "Les ailes gauche et droite ont des durées identiques à la seconde, chaque opération porte un aléa "
-        "différent et un seul. Les causes déclarées ne sont pas vérifiées : on les traite comme des pistes.",
+        "DQ-08", "Clearly synthetic data",
+        "Left and right wings have durations identical to the second, and each operation carries exactly one, "
+        "different, incident. Declared causes are not verified: they are treated as leads.",
         "info", ["MES:L21", "MES:L37"], ["cause racine"]))
 
     findings.append(Finding(
-        "DQ-09", "Informations absentes des trois systèmes",
-        "Aucune révision PLM, aucun lot ERP, aucun code défaut, aucune ressource par opération, un seul "
-        "avion tracé. Tout ce qui en dépend dans l'application est simulé et étiqueté comme tel.",
+        "DQ-09", "Information missing from all three systems",
+        "No PLM revision, no ERP batch, no defect code, no resource per operation, a single aircraft traced. "
+        "Anything in the application that depends on them is simulated and labelled as such.",
         "haute", ["MES:L1", "PLM:L1", "ERP:L1"], ["lot", "révision", "défaut", "opérateur"]))
     return findings
 
@@ -341,7 +374,7 @@ class Dataset:
 def load_all(data_dir: Path = DATA_DIR) -> Dataset:
     mes = load_mes(data_dir)
     plm = load_plm(data_dir)
-    erp = load_erp_pseudonymized(data_dir)
+    erp = load_erp(data_dir)
     steps, inv = load_notice(data_dir)
     cad = load_cad_counts(data_dir)
     bom = bom_vs_sources(plm, mes, inv, cad)

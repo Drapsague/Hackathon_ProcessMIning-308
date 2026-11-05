@@ -45,7 +45,7 @@ def main():
     ds.bom.to_csv(OUT / "nomenclature_4_sources.csv", index=False)
     M.three_versions(ds).to_csv(OUT / "trois_versions.csv", index=False)
     M.station_table(sim, ds).to_csv(OUT / "postes_simulation.csv", index=False)
-    ds.erp.drop(columns=["skills"]).to_csv(OUT / "erp_pseudonymise.csv", index=False)
+    ds.erp.drop(columns=["skills"]).to_csv(OUT / "erp.csv", index=False)
     with open(OUT / "constats_qualite.json", "w", encoding="utf-8") as f:
         json.dump([vars(x) for x in ds.findings], f, ensure_ascii=False, indent=2)
     with open(OUT / "kpi.json", "w", encoding="utf-8") as f:

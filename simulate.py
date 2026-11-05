@@ -120,7 +120,7 @@ def simulate(ds: Dataset, params: SimParams = SimParams()) -> tuple[pd.DataFrame
 
     operators = ds.erp.sort_values("operator_id").groupby("poste")["operator_id"].apply(list).to_dict()
     plm = ds.plm.set_index("code")
-    long_lead = plm[(plm["criticality"] == "Critique") & (plm["lead_max_days"] >= 35)]
+    long_lead = plm[(plm["criticality"] == "Critical") & (plm["lead_max_days"] >= 35)]
     wait_at = {}
     for code, row in long_lead.iterrows():
         first = next((p for p in postes if code in m.loc[p, "refs"]), None)
