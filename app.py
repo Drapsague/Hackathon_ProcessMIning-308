@@ -636,6 +636,31 @@ with t_glo:
         st.info("No term matches the search.")
 
 
+def message(a):
+    with st.chat_message("user"):
+        st.write(a.question)
+    with st.chat_message("assistant", avatar=":material/smart_toy:"):
+        if a.refused:
+            st.error(a.text)
+        else:
+            for s in a.sentences:
+                if s.ok and s.interpretation:
+                    st.markdown(f"*{s.text.strip()}*")
+                elif s.ok:
+                    body = re.sub(r"\s*\[[^\]]+\]", "", s.text).strip()
+                    st.markdown(f"{body} " + " ".join(f"`{i}`" for i in s.ids))
+        with st.expander(f"Cited evidence ({len(a.evidence)})"):
+            for e in a.evidence.values():
+                st.markdown(f"`{e.id}` · {e.source}  \n{e.text}")
+        with st.expander("Pipeline and checks"):
+            st.table(pd.DataFrame(a.steps, columns=["agent", "action"]))
+            if a.sentences:
+                st.dataframe(pd.DataFrame([{"sentence": s.text[:120], "citations": ", ".join(s.ids),
+                                            "validated": s.ok, "hypothesis": s.interpretation,
+                                            "issues": "; ".join(s.issues)} for s in a.sentences]),
+                             hide_index=True)
+
+
 def chat_panel():
     st.markdown("#### AI assistant")
     st.caption(f"Every sentence cites its source; hypotheses in italics · writer: {assistant.writer.mode}")
@@ -646,6 +671,9 @@ def chat_panel():
         for i, q in enumerate(DEMO_QUESTIONS):
             if cols[i % 2].button(q, key=f"demo{i}", use_container_width=True):
                 st.session_state.pending = q
+    # la conversation se lit de haut en bas, la saisie reste en dessous : on réserve la place des messages
+    # avant le formulaire, puis on les remplit une fois la nouvelle question traitée
+    fil = st.container()
     with st.form("question", clear_on_submit=True):
         q1, q2 = st.columns([3.6, 1.4])
         saisie = q1.text_input("Question", placeholder="Ask a question about Air+ production",
@@ -653,30 +681,18 @@ def chat_panel():
         envoyer = q2.form_submit_button("Send", use_container_width=True)
     q = saisie if envoyer and saisie.strip() else st.session_state.pop("pending", None)
     if q:
-        st.session_state.history.insert(0, assistant.ask(q))
-    for a in st.session_state.history[:4]:
-        with st.chat_message("user"):
-            st.write(a.question)
-        with st.chat_message("assistant", avatar=":material/smart_toy:"):
-            if a.refused:
-                st.error(a.text)
-            else:
-                for s in a.sentences:
-                    if s.ok and s.interpretation:
-                        st.markdown(f"*{s.text.strip()}*")
-                    elif s.ok:
-                        body = re.sub(r"\s*\[[^\]]+\]", "", s.text).strip()
-                        st.markdown(f"{body} " + " ".join(f"`{i}`" for i in s.ids))
-            with st.expander(f"Cited evidence ({len(a.evidence)})"):
-                for e in a.evidence.values():
-                    st.markdown(f"`{e.id}` · {e.source}  \n{e.text}")
-            with st.expander("Pipeline and checks"):
-                st.table(pd.DataFrame(a.steps, columns=["agent", "action"]))
-                if a.sentences:
-                    st.dataframe(pd.DataFrame([{"sentence": s.text[:120], "citations": ", ".join(s.ids),
-                                                "validated": s.ok, "hypothesis": s.interpretation,
-                                                "issues": "; ".join(s.issues)} for s in a.sentences]),
-                                 hide_index=True)
+        with st.spinner("Analysing…"):
+            st.session_state.history.append(assistant.ask(q))
+    with fil:
+        for a in st.session_state.history[-6:]:
+            message(a)
+    if st.session_state.history:
+        # fait défiler la fenêtre jusqu'à la dernière réponse
+        components.html(f"""<script>
+        const b = window.parent.document.querySelector('[data-testid="stPopoverBody"]');
+        if (b) setTimeout(() => b.scrollTo({{top: b.scrollHeight, behavior: "smooth"}}), 150);
+        // {len(st.session_state.history)}
+        </script>""", height=0)
     with st.expander("AI rules applied (specification, IA01 to IA08)"):
         st.markdown(
             "- **IA01 No invention / IA05 Insufficient data**: the checker removes any figure without evidence; with "
@@ -689,7 +705,9 @@ def chat_panel():
             "- **IA06 Verifiable recommendations**: every proposed action cites the data behind it.\n"
             "- **IA07 Confidentiality**: ERP first names, last names and comments are never loaded; the LLM receives "
             "employee IDs and per-station aggregates.\n"
-            "- **IA08 Deterministic calculations**: Python computes (rules.py), the AI only writes.")
+            "- **IA08 Deterministic calculations**: Python computes (rules.py), the AI only writes. For a question with "
+            "no planned calculation, the LLM writes a pandas expression that Python runs in a locked sandbox; the "
+            "expression and its result are shown in the evidence.")
 
 
 with st.container(key="chat_fab"):

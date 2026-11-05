@@ -69,6 +69,9 @@ GLOSSAIRE = [
 
     ("AI assistant", "Analyst, Librarian, Writer, Checker", "The assistant's four steps: facts computed in Python, "
      "search for nearby evidence, drafting (template or LLM), check of every sentence."),
+    ("AI assistant", "LLM-written query", "For a question no planned calculation covers, the LLM writes one pandas "
+     "expression over the MES, PLM and ERP tables; Python runs it in a locked sandbox (no import, no file access, "
+     "5-second limit) and the result becomes cited evidence (STAT:query_…)."),
     ("AI assistant", "Hypothesis", "Interpretation sentence in italics, with no figures: it suggests a reading the "
      "data does not prove."),
     ("AI assistant", "Insufficient data", "Refusal answer when no evidence can support a reply."),

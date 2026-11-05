@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -96,7 +97,8 @@ def build_corpus(ds: Dataset, log: pd.DataFrame, trace: pd.DataFrame) -> dict[st
     for poste, g in ds.erp.groupby("poste"):
         levels = ", ".join(f"{k} {v}" for k, v in g["level"].value_counts().items())
         put(Evidence(f"ERP:P{poste}", (
-            f"Station {poste}: {len(g)} assigned operators, employee IDs {', '.join(sorted(g['operator_id']))}, "
+            f"Station {poste}: {len(g)} assigned operators, employee IDs " + ", ".join(
+                f"{m} ({lv})" for m, lv in sorted(zip(g["operator_id"], g["level"]))) + ", "
             f"average hourly cost €{_fmt(g['hourly_cost_eur'].mean(), 2)}, levels: {levels}."), "ERP"))
     for r in ds.notice_steps.itertuples():
         put(Evidence(r.evidence, (
@@ -142,19 +144,34 @@ DOMAIN_STEMS = {
     "skill", "certi", "line", "shop", "facto", "model", "cad", "data", "recomm", "impro", "bottl", "wing",
     "tail", "gear", "engin", "nose", "screw", "light", "harne", "consu", "missi", "gap", "gdpr", "sever",
     "criti", "prior", "score", "overr", "finan", "price", "expen", "budge", "money", "slow",
+    "exper", "nivea", "level", "senio", "junio", "debut", "begin", "ancie",
 }
 
-# Mots anglais de la question -> mots des libellés MES (en français dans les fichiers sources)
-ZONE_EN = {
-    "wing": "aile", "wings": "aile", "tail": "queue", "landing": "train", "gear": "train", "engine": "reacteur",
-    "engines": "reacteur", "reactor": "reacteur", "nose": "nez", "fuselage": "fuselage", "cockpit": "cockpit",
-    "wiring": "faisceaux", "harness": "faisceaux", "left": "gauche", "right": "droite", "screws": "visserie",
-    "fasteners": "visserie",
+# Les libellés MES sont en anglais (fichiers UK) ou en français (FR) : on ajoute à la question les mots de
+# l'autre langue pour que « ailes » retrouve « Wing Assembly » et « wings » retrouve « Assemblage aile »
+ZONES = {
+    "wing": "aile", "tail": "queue", "landing": "train", "gear": "train", "engine": "reacteur moteur",
+    "reactor": "reacteur", "nose": "nez", "fuselage": "fuselage", "cockpit": "cockpit", "wiring": "faisceaux",
+    "harness": "faisceaux", "fastener": "visserie", "screw": "visserie", "sticker": "stickers", "decal": "stickers",
+    "light": "lumiere", "tip": "bout",
 }
+ZONES_FR = {"aile": "wing", "ailes": "wing", "queue": "tail", "train": "landing gear", "atterrissage": "landing gear",
+            "atterissage": "landing gear", "reacteur": "reactor engine", "reacteurs": "reactor engine",
+            "moteur": "engine", "moteurs": "engine", "nez": "nose", "faisceau": "harness", "faisceaux": "harness",
+            "visserie": "fastener", "autocollant": "stickers", "autocollants": "stickers", "stickers": "stickers",
+            "lumiere": "light", "feu": "light", "feux": "light", "gauche": "left", "droite": "right",
+            "droit": "right", "arriere": "rear", "roue": "wheel", "roues": "wheel", "ecrou": "nut", "ecrous": "nut",
+            "vis": "screws", "rondelle": "washer", "entretoise": "spacer", "tournevis": "screwdriver",
+            "boitier": "box", "electronique": "electronic", "arbre": "shaft", "aileron": "aileron"}
 
 
 def en_to_fr(question: str) -> str:
-    extra = [ZONE_EN[w] for w in raw_tokens(question) if w in ZONE_EN]
+    extra = []
+    for w in raw_tokens(question):
+        if w.rstrip("s") in ZONES:
+            extra.append(ZONES[w.rstrip("s")])
+        if w in ZONES_FR:
+            extra.append(ZONES_FR[w])
     return question + (" " + " ".join(extra) if extra else "")
 
 
@@ -255,9 +272,9 @@ class Analyst:
         facts.append(Fact(f"In the manual, this is step {poste} on page {step['page_notice']}, section "
                           f"{step['section']}.", [step["evidence"]]))
         if f"ERP:P{poste}" in self.ev:
-            mats = sorted(self.ds.erp.loc[self.ds.erp["poste"] == poste, "operator_id"])
-            facts.append(Fact(f"The ERP assigns {len(mats)} operators to this station: {', '.join(mats)}.",
-                              [f"ERP:P{poste}"]))
+            g = self.ds.erp[self.ds.erp["poste"] == poste].sort_values("operator_id")
+            facts.append(Fact(f"The ERP assigns {len(g)} operators to this station: " + ", ".join(
+                f"{m} ({lv})" for m, lv in zip(g["operator_id"], g["level"])) + ".", [f"ERP:P{poste}"]))
         o = self.res.operations.set_index("poste").loc[poste]
         sid = self.stat(f"STAT:score_P{poste:02d}", (
             f"Station {poste}: delay {_fmt(o['retard_pct'], 1)}%, severity {o['gravite']} ({o['pts_retard']} points), "
@@ -286,6 +303,16 @@ class Analyst:
         facts = [Fact(f"{code} ({p['designation']}) appears {int(p['qty_bom'])} time(s) in the bill of materials, "
                       f"supplied by {p['supplier']} within {p['lead_time']}, criticality {p['criticality']}.",
                       [f"PLM:{code}"])]
+        fr_ = self.res.fin_refs.set_index("code")
+        if code in fr_.index:
+            c = fr_.loc[code]
+            sid = self.stat(f"STAT:cout_{code}", (
+                f"FIN02 {code}: unit cost €{c['unit_cost_eur']:,.0f} x quantity {int(c['qty_bom'])} = "
+                f"€{c['cout_reference']:,.0f}, i.e. {_fmt(c['part_pct'], 2)}% of the total parts cost "
+                f"€{self.res.fin['cout_total']:,.0f}; mass {_fmt(p['mass_kg'], 2)} kg."))
+            facts.append(Fact(f"It costs €{c['unit_cost_eur']:,.0f} per unit, so €{c['cout_reference']:,.0f} for the "
+                              f"{int(c['qty_bom'])} unit(s) needed, i.e. {_fmt(c['part_pct'], 2)}% of the total parts "
+                              f"cost; it weighs {_fmt(p['mass_kg'], 2)} kg.", [sid, f"PLM:{code}"]))
         if len(uses):
             sid = self.stat(f"STAT:conso_{code}", (
                 f"MSN-001: {code} appears {int(bom['mes'])} time(s) in the MES (bill of materials {int(p['qty_bom'])}), "
@@ -308,6 +335,21 @@ class Analyst:
             facts.append(Fact(f"In the simulation, it is traced over {t['case_id'].nunique()} aircraft with "
                               f"{t['erp_lot'].nunique()} ERP batches and revisions {revs}.", [sid], True))
         return facts
+
+    def part_by_name(self, question: str) -> list[str]:
+        """Références dont tous les mots de la désignation sont dans la question (« moteur » -> Engine -> D142)."""
+        q = {stem(t) for t in raw_tokens(en_to_fr(question)) if len(t) >= 3}
+        hits = {}
+        for des, g in self.ds.plm.groupby("designation"):
+            words = {stem(t) for t in raw_tokens(des) if len(t) >= 3}
+            seen = words & q
+            # tous les mots, ou tous sauf un pour une désignation d'au moins trois mots (« nez gauche » -> Left Nose Cone)
+            if seen and len(words) - len(seen) <= (1 if len(words) >= 3 else 0):
+                hits[des] = (seen, g["code"].tolist())
+        # on garde la désignation la plus précise (« Landing Gear Wheel » plutôt que « Landing Gear »)
+        best = [d for d, (w, _) in hits.items() if not any(w < w2 for w2, _ in hits.values())]
+        codes = [c for d in best for c in hits[d][1]]
+        return codes if 0 < len(codes) <= 3 else []
 
     def causes(self) -> list[Fact]:
         fp = M.family_pareto(self.ds)
@@ -467,6 +509,172 @@ class Analyst:
                  "delay.", ["DQ-09"]),
         ]
 
+    def experience(self) -> list[Fact]:
+        e = self.ds.erp
+        ordre = {"Beginner": 1, "Experienced": 2, "Expert": 3}
+        counts = e["level"].value_counts().reindex(list(ordre), fill_value=0)
+        n = int(counts.sum())
+        moyenne = float((e["level"].map(ordre)).mean())
+        cumul = counts.cumsum()
+        mediane = next(k for k in ordre if cumul[k] >= n / 2)
+        par_poste = e.assign(niveau=e["level"].map(ordre)).groupby("poste")["niveau"].mean()
+        bas, haut = par_poste.idxmin(), par_poste.idxmax()
+        sid = self.stat("STAT:experience", (
+            f"ERP experience levels over {n} resources: Beginner {counts['Beginner']}, Experienced "
+            f"{counts['Experienced']}, Expert {counts['Expert']}. Coding Beginner = 1, Experienced = 2, Expert = 3: "
+            f"average {_fmt(moyenne, 2)}, median level {mediane}. Lowest station average: station {bas} "
+            f"({_fmt(par_poste[bas], 2)}); highest: station {haut} ({_fmt(par_poste[haut], 2)})."))
+        return [
+            Fact(f"The ERP lists {counts['Expert']} Expert, {counts['Experienced']} Experienced and "
+                 f"{counts['Beginner']} Beginner resources out of {n}.", [sid]),
+            Fact(f"Coding the levels 1 to 3, the average is {_fmt(moyenne, 2)}, between Experienced and Expert, and "
+                 f"the median resource is {mediane}.", [sid]),
+            Fact(f"By station, the average ranges from {_fmt(par_poste[bas], 2)} at station {bas} to "
+                 f"{_fmt(par_poste[haut], 2)} at station {haut}.", [sid]),
+            Fact("A level is declared in the ERP, not measured, and the MES does not say who did each operation: it "
+                 "cannot be linked to a delay.", ["DQ-09"]),
+        ]
+
+    def topics(self, q: str, every: bool = False) -> list[Fact]:
+        """Questions d'agrégat courantes (moyennes, maximums, comptages) : un fait chiffré par sujet reconnu."""
+        mes, plm, erp, o = self.ds.mes, self.ds.plm, self.ds.erp, self.res.operations
+        facts: list[Fact] = []
+
+        def add(pattern, sid, text, claims):
+            if every or re.search(pattern, q):
+                self.stat(sid, text)
+                facts.extend(Fact(c, [sid]) for c in claims)
+
+        heavy = plm.loc[plm["mass_kg"].idxmax()]
+        add(r"lourd|masse|poids|heav|\bmass\b|weigh", "STAT:masse", (
+            f"PLM masses: heaviest reference {heavy['code']} ({heavy['designation']}) {_fmt(heavy['mass_kg'], 2)} kg; "
+            f"total mass of the bill of materials {_fmt((plm['mass_kg'] * plm['qty_bom']).sum(), 1)} kg."),
+            [f"The heaviest part is {heavy['code']} ({heavy['designation']}) at {_fmt(heavy['mass_kg'], 2)} kg, and "
+             f"the full bill of materials weighs {_fmt((plm['mass_kg'] * plm['qty_bom']).sum(), 1)} kg."])
+        top_cad = plm.loc[plm["cad_hours"].idxmax()]
+        add(r"\bcao\b|\bcad\b|conception|design", "STAT:cao", (
+            f"PLM CAD design time: total {_fmt(plm['cad_hours'].sum(), 0)} h over {len(plm)} references; largest "
+            f"{top_cad['code']} ({top_cad['designation']}) {_fmt(top_cad['cad_hours'], 0)} h."),
+            [f"CAD design time adds up to {_fmt(plm['cad_hours'].sum(), 0)} h over {len(plm)} references, the largest "
+             f"being {top_cad['code']} ({top_cad['designation']}) with {_fmt(top_cad['cad_hours'], 0)} h."])
+        sup = plm.groupby("supplier").agg(refs=("code", "count"), qty=("qty_bom", "sum")).sort_values(
+            ["refs", "qty"], ascending=False)
+        add(r"combien .*fournisseur|nombre de fournisseurs|how many suppliers|fournisseur.*(plus|principal)|"
+            r"supplier.*(most|main)|(most|main).*supplier", "STAT:fournisseurs", (
+            f"PLM: {len(sup)} suppliers; most references: {sup.index[0]} ({int(sup.iloc[0]['refs'])} references, "
+            f"{int(sup.iloc[0]['qty'])} units), then {sup.index[1]} ({int(sup.iloc[1]['refs'])} references)."),
+            [f"The PLM lists {len(sup)} suppliers; {sup.index[0]} supplies the most references "
+             f"({int(sup.iloc[0]['refs'])}, {int(sup.iloc[0]['qty'])} units), ahead of {sup.index[1]} "
+             f"({int(sup.iloc[1]['refs'])})."])
+        add(r"delai moyen|delai.*moyen|average lead|mean lead|lead time.*average|moyenne.*delai",
+            "STAT:delai_moyen", (
+            f"PLM lead times (upper bound): average {_fmt(plm['lead_max_days'].mean(), 1)} days, from "
+            f"{_fmt(plm['lead_max_days'].min(), 0)} to {_fmt(plm['lead_max_days'].max(), 0)} days; Q3 "
+            f"{_fmt(self.res.q3_delai, 2)} days."),
+            [f"Using the upper bound of each range, the average supply lead time is "
+             f"{_fmt(plm['lead_max_days'].mean(), 1)} days, from {_fmt(plm['lead_max_days'].min(), 0)} to "
+             f"{_fmt(plm['lead_max_days'].max(), 0)} days."])
+        crit = plm["criticality"].value_counts()
+        add(r"piece.*critique|critical part|criticit|combien .*critique|how many critical part", "STAT:criticite", (
+            "PLM criticality: " + ", ".join(f"{k} {int(crit.get(k, 0))}" for k in R.COULEURS_CRITICITE) +
+            f"; {self.res.kpi['operations_piece_critique']} MES operations use at least one critical part."),
+            ["The PLM counts " + ", ".join(f"{int(crit.get(k, 0))} {k.lower()}" for k in reversed(list(R.COULEURS_CRITICITE)))
+             + f" references, and {self.res.kpi['operations_piece_critique']} operations use at least one critical part."])
+        add(r"taux de retard|delay rate|retard moyen|average delay|mean delay|en moyenne.*retard|moyenne.*retard",
+            "STAT:retard_moyen", (
+            f"MES03 over {len(o)} operations: delay rate {_fmt(self.res.kpi['taux_retard'], 0)}%, average delay "
+            f"{_fmt(o['retard_pct'].mean(), 1)}%, median {_fmt(o['retard_pct'].median(), 1)}%, from "
+            f"{_fmt(o['retard_pct'].min(), 1)}% to {_fmt(o['retard_pct'].max(), 1)}%, average gap "
+            f"{_fmt(o['ecart_min'].mean(), 2)} min."),
+            [f"{_fmt(self.res.kpi['taux_retard'], 0)}% of operations are late, with an average delay of "
+             f"{_fmt(o['retard_pct'].mean(), 1)}% (median {_fmt(o['retard_pct'].median(), 1)}%, from "
+             f"{_fmt(o['retard_pct'].min(), 1)}% to {_fmt(o['retard_pct'].max(), 1)}%), i.e. "
+             f"{_fmt(o['ecart_min'].mean(), 2)} min per operation."])
+        jours = mes.assign(j=mes["start"].dt.strftime("%d/%m")).groupby("j").agg(
+            ops=("poste", "count"), dep=("overrun_min", "sum")).sort_values("dep", ascending=False)
+        add(r"\bjours?\b|\bdays?\b|\bdates?\b|journee", "STAT:jours", (
+            "MES overrun by day: " + "; ".join(f"{j} {int(r.ops)} operations +{_fmt(r.dep, 2)} min"
+                                                for j, r in jours.iterrows()) + "."),
+            [f"The worst day is {jours.index[0]}: {int(jours.iloc[0]['ops'])} operations and "
+             f"+{_fmt(jours.iloc[0]['dep'], 2)} min of overrun.",
+             "By day: " + ", ".join(f"{j} (+{_fmt(r.dep, 2)} min)" for j, r in jours.iterrows()) + "."])
+        fast, small = mes.loc[mes["real_min"].idxmin()], mes.loc[mes["overrun_pct"].idxmin()]
+        add(r"rapide|plus court|fastest|shortest|quickest|moins de retard|least delay|smallest", "STAT:rapide", (
+            f"MES: shortest operation station {fast['poste']} ({fast['operation']}) {_fmt(fast['real_min'], 2)} min; "
+            f"smallest relative delay station {small['poste']} ({small['operation']}) +{_fmt(small['overrun_pct'], 1)}%."),
+            [f"The shortest operation is station {fast['poste']} ({fast['operation']}) with "
+             f"{_fmt(fast['real_min'], 2)} min, and the smallest relative delay is at station {small['poste']} "
+             f"({small['operation']}), +{_fmt(small['overrun_pct'], 1)}%."])
+        fin_ = (mes["start"] + pd.to_timedelta(mes["real_min"], unit="m")).max()
+        add(r"(temps|duree) moyen|moyenne.*(temps|duree)|(temps|duree).*moyenne|average (assembly |operation )?"
+            r"(time|duration)|mean (time|duration)|(time|duration).*average", "STAT:duree_moyenne", (
+            f"MES over {len(mes)} operations: average actual duration {_fmt(mes['real_min'].mean(), 2)} min, average "
+            f"planned {_fmt(mes['planned_min'].mean(), 2)} min, median actual {_fmt(mes['real_min'].median(), 2)} min, "
+            f"from {_fmt(mes['real_min'].min(), 2)} to {_fmt(mes['real_min'].max(), 2)} min. Whole aircraft "
+            f"{_fmt(mes['real_min'].sum() / 60, 1)} h actual for {_fmt(mes['planned_min'].sum() / 60, 1)} h planned, "
+            f"from {mes['start'].min():%d/%m %H:%M} to {fin_:%d/%m %H:%M}."),
+            [f"An operation takes {_fmt(mes['real_min'].mean(), 2)} min on average against {_fmt(mes['planned_min'].mean(), 2)} "
+             f"min planned (median {_fmt(mes['real_min'].median(), 2)} min, from {_fmt(mes['real_min'].min(), 2)} to "
+             f"{_fmt(mes['real_min'].max(), 2)} min).",
+             f"The whole aircraft took {_fmt(mes['real_min'].sum() / 60, 1)} h of actual work for "
+             f"{_fmt(mes['planned_min'].sum() / 60, 1)} h planned, spread from {mes['start'].min():%d/%m %H:%M} to "
+             f"{fin_:%d/%m %H:%M}."])
+        hc = erp["hourly_cost_eur"]
+        add(r"cout horaire|taux horaire|hourly|salaire|salary|wage|remuneration", "STAT:cout_horaire", (
+            f"ERP hourly costs over {len(erp)} resources: average €{_fmt(hc.mean(), 2)}, median €{_fmt(hc.median(), 2)}, "
+            f"from €{_fmt(hc.min(), 2)} to €{_fmt(hc.max(), 2)}."),
+            [f"The average hourly cost of a resource is €{_fmt(hc.mean(), 2)} (median €{_fmt(hc.median(), 2)}), from "
+             f"€{_fmt(hc.min(), 2)} to €{_fmt(hc.max(), 2)}; the ERP gives costs, not individual salaries."])
+        eff = erp.groupby("poste")["operator_id"].nunique()
+        add(r"(plus|moins) d.?(employ|operat|matricule|ressource|personne)|(most|fewest|least) (employees|operators|"
+            r"staff|people|resources)|effectif (max|min|moyen)", "STAT:effectif_postes", (
+            f"ERP headcount by station: average {_fmt(eff.mean(), 2)}, maximum {eff.max()} at "
+            f"{(eff == eff.max()).sum()} stations, minimum {eff.min()} at {(eff == eff.min()).sum()} stations."),
+            [f"Stations have {_fmt(eff.mean(), 2)} declared resources on average: {(eff == eff.max()).sum()} stations "
+             f"have {eff.max()} and {(eff == eff.min()).sum()} have {eff.min()}."])
+        quals = erp["qualification"].value_counts()
+        add(r"qualif", "STAT:qualifications", (
+            f"ERP qualifications: {len(quals)} distinct; " + ", ".join(f"{k} {v}" for k, v in quals.head(5).items()) + "."),
+            [f"The ERP has {len(quals)} distinct qualifications, the most common being "
+             + ", ".join(f"{k} ({v})" for k, v in quals.head(3).items()) + "."])
+        certs = pd.Series([c.strip() for s_ in erp["certifications"] for c in str(s_).split(",") if c.strip()]).value_counts()
+        add(r"habilit|certif", "STAT:habilitations", (
+            f"ERP certifications: {len(certs)} distinct; " + ", ".join(f"{k} {v}" for k, v in certs.head(6).items()) + "."),
+            ["The most frequent certifications are " + ", ".join(f"{k} ({v})" for k, v in certs.head(4).items())
+             + f", out of {len(certs)} distinct ones."])
+        bands = erp["age_band"].value_counts().sort_index()
+        add(r"\bage\b|how old|average age|age moyen|ages", "STAT:ages", (
+            "ERP age bands (aggregate, no individual data): " + ", ".join(f"{k} {v}" for k, v in bands.items()) + "."),
+            ["By age band, the ERP counts " + ", ".join(f"{v} people aged {k}" for k, v in bands.items())
+             + "; individual ages are not shown."])
+        prov = o[o["score_provisoire"]]
+        add(r"provisoire|provisional", "STAT:provisoires", (
+            f"Provisional P04 scores: {len(prov)} ("
+            + "; ".join(f"station {r.poste} score {r.score}/100: {r.limites_score}" for r in prov.itertuples()) + ")."),
+            [f"{len(prov)} score is provisional: " + "; ".join(
+                f"station {r.poste} ({r.operation}), {r.score}/100, {r.limites_score}" for r in prov.itertuples()) + "."]
+            if len(prov) else ["No score is provisional."])
+        fp = self.res.fin_postes.dropna(subset=["cout_horaire_theorique"])
+        hi, lo = fp.loc[fp["cout_horaire_theorique"].idxmax()], fp.loc[fp["cout_horaire_theorique"].idxmin()]
+        add(r"poste.*(cher|couteu)|station.*(expensive|costl)|(expensive|costliest) station", "STAT:poste_cout", (
+            f"FIN04 by station: highest station {int(hi['poste'])} ({hi['operation']}) "
+            f"{_fmt(hi['cout_horaire_theorique'], 2)} €/h with {int(hi['ressources_valides'])} resources; lowest station "
+            f"{int(lo['poste'])} ({lo['operation']}) {_fmt(lo['cout_horaire_theorique'], 2)} €/h."),
+            [f"The station with the highest theoretical hourly cost is station {int(hi['poste'])} ({hi['operation']}) "
+             f"at {_fmt(hi['cout_horaire_theorique'], 2)} €/h for {int(hi['ressources_valides'])} resources; the lowest "
+             f"is station {int(lo['poste'])} at {_fmt(lo['cout_horaire_theorique'], 2)} €/h."])
+        add(r"\bq3\b|quartile", "STAT:q3", (
+            f"PLM02: Q3 of lead times (upper bound) = {_fmt(self.res.q3_delai, 2)} days; "
+            f"{self.res.kpi['pieces_delai_eleve']} references above it."),
+            [f"Q3 is the third quartile of supply lead times: {_fmt(self.res.q3_delai, 2)} days, and "
+             f"{self.res.kpi['pieces_delai_eleve']} references are above it, which the rules call a long lead time."])
+        if not every and re.search(r"meilleur|best|pire|worst|plus performant|most efficient|plus efficace|"
+                                   r"classement|rank", q):
+            facts.append(Fact("The data cannot rank individual operators: the MES does not record who carried out "
+                              "each operation, only the ERP resources declared on each station.", ["DQ-09"]))
+            facts += self.experience()[:2]
+        return facts
+
     def data_quality(self) -> list[Fact]:
         sev = [f for f in self.ds.findings if f.severity == "haute"]
         return [Fact(f"{f.title}: {f.detail.split('. ')[0].rstrip('.')}.", [f.id]) for f in sev[:5]]
@@ -583,6 +791,7 @@ INTENTS = [
     ("priorities", r"priorit|score|examiner|investig|urgen|look at first"),
     ("gravity", r"gravit|severit|retards? (importants?|critiques?)|(major|critical) delays?|"
                 r"combien d.operations? en retard|how many (operations )?(are )?(late|delayed)"),
+    ("experience", r"experien|niveau|\blevels?\b|seniorit|anciennet|junior|senior|debutant|beginner|expert"),
     ("workforce", r"operateurs|equipes?\b|competen|habilit|form[ea]|effectif|qualification|personnel|salaries|"
                   r"operators|teams?\b|workforce|headcount|skills?|certific|staff|employees"),
     ("recommendations", r"recommand|que faire|plan d.?action|ameliorer|levier|conseil|recommend|what should|"
@@ -602,8 +811,12 @@ INTENTS = [
                  r"overview|how long"),
 ]
 
-PERSONAL = (r"\bnoms?\b|prenom|\bage\b|identit|adresse|telephone|salaire de|\bnames?\b|first name|surname|"
-            r"how old|\baddress|phone|salary of")
+# questions qui portent sur les attributs d'une pièce : on cherche alors la pièce par son nom
+PART_Q = (r"cout|prix|cher|cost|price|masse|poids|pese|weigh|heavy|lourd|fournisseur|fournit|supplier|supplies|"
+          r"delai|lead.?time|criticit|quantit|combien de|how many|how much|\bpieces?\b|\bparts?\b|reference|trace")
+
+PERSONAL = (r"\bnoms?\b|prenom|identit|adresse|telephone|salaire de|\bnames?\b|first name|surname|"
+            r"\baddress|phone|salary of|age.{0,25}\bair\d{3,4}\b")
 PREDICTION = (r"prevo|predi|futur|l.?annee prochaine|en 202[7-9]|dans \d+ (mois|ans)|"
               r"combien .* livr.* (decembre|janvier|mois)|forecast|next year|in 202[7-9]|in \d+ (months|years)|"
               r"how many .* deliver.* (december|january|month)")
@@ -630,7 +843,9 @@ class Writer:
         "interpretation sentence starts with \"Hypothesis:\" or \"Interpretation:\", contains no figures and needs "
         "no citation. Say what is missing to confirm it.\n"
         "6. Answer exactly \"INSUFFICIENT DATA\" followed by one explanatory sentence only if no fact relates to the "
-        "question.\n"
+        "question. When the facts give partial information (for example the employee IDs assigned to a station "
+        "while the MES does not say who did the work), give that information and state the limit instead of "
+        "refusing.\n"
         "Answer in English, in 2 to 6 short sentences, with no list or heading. Names of operations, incidents and "
         "parts stay as written in the facts."
     )
@@ -669,12 +884,13 @@ class Writer:
             self.last_error = f"{type(exc).__name__}: {exc}"[:160]
             return self.template(facts)
 
-    def _call(self, user: str) -> str:
+    def _call(self, user: str, system: str | None = None) -> str:
+        system = system or self.SYSTEM
         if self.provider == "groq":
             from groq import Groq
             resp = Groq(api_key=os.environ["GROQ_API_KEY"]).chat.completions.create(
                 model=os.environ.get("AIRPLUS_LLM_MODEL", "openai/gpt-oss-120b"), temperature=0,
-                messages=[{"role": "system", "content": self.SYSTEM}, {"role": "user", "content": user}])
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
             return resp.choices[0].message.content or ""
         if self.provider == "anthropic":
             r = requests.post(
@@ -682,7 +898,7 @@ class Writer:
                 headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
                 json={"model": os.environ.get("AIRPLUS_LLM_MODEL", "claude-sonnet-5-5"), "max_tokens": 600,
-                      "temperature": 0, "system": self.SYSTEM, "messages": [{"role": "user", "content": user}]},
+                      "temperature": 0, "system": system, "messages": [{"role": "user", "content": user}]},
                 timeout=60)
             r.raise_for_status()
             return "".join(b.get("text", "") for b in r.json()["content"])
@@ -691,11 +907,139 @@ class Writer:
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}"},
             json={"model": os.environ.get("AIRPLUS_LLM_MODEL", "gpt-4o-mini"), "temperature": 0,
-                  "messages": [{"role": "system", "content": self.SYSTEM}, {"role": "user", "content": user}]},
+                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
             timeout=60)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
+
+
+class QueryRunner:
+    """Le LLM écrit une expression pandas, Python l'exécute sur des copies des tableaux, dans un espace verrouillé
+    (pas d'import, pas de fichier, pas d'attribut caché). Le résultat devient une preuve citée : c'est toujours
+    Python qui calcule (IA08) et le contrôleur vérifie les chiffres contre ce résultat (IA01)."""
+
+    FORBIDDEN = re.compile(
+        r"__|\bimport\b|\bopen\s*\(|\bexec\b|\beval\b|\bcompile\b|\bglobals\b|\blocals\b|\bvars\s*\(|getattr|"
+        r"setattr|delattr|\bos\.|\bsys\.|subprocess|\.to_(csv|excel|pickle|parquet|json|sql|hdf|feather|html|"
+        r"clipboard|latex|markdown|stata|xml|orc)|read_|\.query\s*\(|\.eval\s*\(|\binput\s*\(|breakpoint|\bdel\b|"
+        r"inplace|\bwhile\b|\.pipe\s*\(|\*\*|\bpow\s*\(|\.repeat\s*\(|\btile\s*\(|\d{9,}")
+    SAFE_BUILTINS = {"len": len, "sum": sum, "min": min, "max": max, "round": round, "sorted": sorted, "abs": abs,
+                     "list": list, "dict": dict, "set": set, "tuple": tuple, "str": str, "int": int, "float": float,
+                     "bool": bool, "zip": zip, "enumerate": enumerate, "any": any, "all": all}
+
+    SYSTEM = (
+        "You translate a question about an aircraft assembly line into ONE Python expression that computes the "
+        "answer with pandas. Output only the expression, on one line, with no explanation and no code fence.\n"
+        "Rules: use only the DataFrames listed below and `pd`; no import, no assignment, no loop statement, no file "
+        "access; you may use lambdas, comprehensions, groupby, agg, mean, sum, count, idxmax, nlargest, value_counts, "
+        "str.contains. Round floats with round(x, 2). To return several values, return a dict with explicit English "
+        "keys, e.g. {\"average_actual_min\": round(mes.real_min.mean(), 2), \"operations\": len(mes)}. Keep results "
+        "small (at most 15 rows, use .head(15)). Text columns are in English or French depending on the source file; "
+        "use case=False when filtering text. If the tables cannot answer the question, output exactly NONE.\n\n"
+    )
+
+    def __init__(self, ds: Dataset, res: R.Resultats):
+        o = res.operations
+        self.tables = {
+            "mes": ds.mes.drop(columns=["activity", "end_from_duration"], errors="ignore"),
+            "plm": ds.plm,
+            "erp": ds.erp.drop(columns=["age_band"], errors="ignore"),
+            "ops": o[["poste", "operation", "start", "planned_min", "real_min", "ecart_min", "retard_pct", "gravite",
+                      "incident", "pieces_critiques", "pieces_delai_eleve", "score", "priorite", "score_provisoire",
+                      "effectif_erp"]],
+            "fin_refs": res.fin_refs[["code", "designation", "criticality", "qty_bom", "unit_cost_eur", "cout_reference",
+                                      "part_pct", "part_cumulee_pct"]],
+            "fin_stations": res.fin_postes[["poste", "operation", "ressources_valides", "cout_horaire_theorique",
+                                            "cout_horaire_moyen"]],
+        }
+        notes = {
+            "mes": "one row per MES operation of aircraft MSN-001; poste = station number 1-56; planned_min / real_min "
+                   "= planned / actual minutes; overrun_min = real - planned; overrun_pct in %; start / end_declared = "
+                   "datetimes; alea = declared incident; cause = declared cause; family = incident family code; refs = "
+                   "list of part codes consumed; truncated = end capped at 17:00",
+            "plm": "one row per part reference; qty_bom = quantity in the bill of materials; lead_min_days / "
+                   "lead_max_days = supply lead time range; criticality in Low/Medium/High/Critical; unit_cost_eur; "
+                   "mass_kg; cad_hours",
+            "erp": "one row per ERP resource; operator_id = employee ID; poste = assigned station; level in "
+                   "Beginner/Experienced/Expert; hourly_cost_eur; skills / certifications = comma-separated text; "
+                   "rotation = text",
+            "ops": "business-rule results per operation; retard_pct = delay %; gravite = severity none/minor/major/"
+                   "critical; score = P04 investigation score 0-100; priorite = Low/Medium/High",
+            "fin_refs": "FIN02/FIN03: cost per reference (cout_reference = qty x unit cost), part_pct = share of total %",
+            "fin_stations": "FIN04/FIN05 per station: cout_horaire_theorique = sum of resource hourly costs (€/h), "
+                            "cout_horaire_moyen = average (€/h)",
+        }
+        lines = []
+        for name, df in self.tables.items():
+            cols = ", ".join(f"{c} ({str(df[c].dtype)})" for c in df.columns)
+            lines.append(f"- {name} ({len(df)} rows): {notes[name]}. Columns: {cols}")
+        self.schema = "\n".join(lines)
+        self.n = 0
+
+    @staticmethod
+    def clean(text: str) -> str:
+        t = text.strip()
+        t = re.sub(r"^```(?:python)?|```$", "", t, flags=re.M).strip()
+        lines = [l for l in t.splitlines() if l.strip() and not l.strip().startswith("#")]
+        return " ".join(l.strip() for l in lines)
+
+    def run(self, expr: str):
+        if self.FORBIDDEN.search(expr):
+            raise ValueError("expression refused by the sandbox")
+        def small_range(*args):  # range borné : pas de boucle géante
+            r = range(*args)
+            if len(r) > 10000:
+                raise ValueError("range too large")
+            return r
+
+        env = {"__builtins__": dict(self.SAFE_BUILTINS, range=small_range), "pd": pd}
+        env.update({k: v.copy() for k, v in self.tables.items()})
+        code = compile(expr, "<query>", "eval")
+        out: dict = {}
+
+        def target():
+            try:
+                out["value"] = eval(code, env, {})
+            except Exception as exc:  # renvoyé au fil principal
+                out["error"] = exc
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():
+            raise TimeoutError("query took more than 5 s")
+        if "error" in out:
+            raise out["error"]
+        return out["value"]
+
+    @staticmethod
+    def render(value) -> str:
+        def fmt(v):
+            if isinstance(v, float):
+                return _fmt(v, 2)
+            if hasattr(v, "item") and not isinstance(v, (pd.Series, pd.DataFrame)):
+                try:
+                    return fmt(v.item())
+                except (ValueError, AttributeError):
+                    pass
+            if isinstance(v, pd.Timestamp):
+                return f"{v:%d/%m %H:%M}"
+            if isinstance(v, (pd.Series, pd.DataFrame)):
+                return QueryRunner.render(v)
+            if isinstance(v, (list, tuple)):
+                return ", ".join(fmt(x) for x in v[:20])
+            return str(v)
+
+        if isinstance(value, pd.DataFrame):
+            value = value.head(15)
+            return " | ".join("; ".join(f"{c} {fmt(r[c])}" for c in value.columns) for _, r in value.iterrows())
+        if isinstance(value, pd.Series):
+            value = value.head(15)
+            return "; ".join(f"{k} {fmt(v)}" for k, v in value.items())
+        if isinstance(value, dict):
+            return "; ".join(f"{k} {fmt(v)}" for k, v in list(value.items())[:20])
+        return fmt(value)
 
 CITE = re.compile(r"\[([A-Za-z]+[:\-][^\[\]]+?)\]")
 NUM = re.compile(r"(?<![\w-])\d+(?:[.,]\d+)?")
@@ -764,6 +1108,7 @@ class Assistant:
         self.bm25 = BM25({k: v for k, v in self.evidence.items()})
         self.writer = Writer()
         self.controller = Controller()
+        self.query = QueryRunner(ds, self.analyst.res)
         names = list(ds.plm["supplier"]) + list(ds.plm["designation"]) + list(ds.mes["operation"])
         self.domain = DOMAIN_STEMS | {stem(t) for n in names for t in raw_tokens(n) if len(t) >= 4}
 
@@ -786,6 +1131,7 @@ class Assistant:
                                 steps + [("Analyst", "data missing from the sources")])
 
         facts: list[Fact] = []
+        specific = False  # faits ciblés : pièce, poste, zone, fournisseur ou personnes
         codes = sorted(set(PART_CODE.findall(question.upper())))
         people = re.search(PEOPLE, q) and a.people(question, q)
         if people:
@@ -795,6 +1141,11 @@ class Assistant:
             got = a.part(c)
             steps.append(("Analyst", f"part traceability {c}: {len(got)} facts" if got else f"{c} unknown to the PLM"))
             facts += got
+        if not people and not codes and re.search(PART_Q, q):
+            for c in a.part_by_name(question):
+                got = a.part(c)
+                steps.append(("Analyst", f"part found by name {c}: {len(got)} facts"))
+                facts += got
         for p in [] if people else re.findall(STATION, q):
             n = int(p[0] or p[1])
             got = a.station(n)
@@ -810,7 +1161,17 @@ class Assistant:
             if got:
                 steps.append(("Analyst", f"aircraft zone: {len(got)} facts"))
                 facts += got
-        generic_skip = {"causes", "conformance", "data_quality", "overview"} if facts else set()
+        specific = bool(facts)
+        generic_skip = {"causes", "conformance", "data_quality", "overview", "experience"} if facts else set()
+        if not people:
+            got = a.topics(q)
+            if got:
+                steps.append(("Analyst", f"aggregate topics: {len(got)} facts"))
+                facts = got + facts  # le plus précis d'abord
+        if not specific and self.writer.mode != "deterministic":
+            got = self._computed(question, steps)
+            if got:
+                facts = got + facts
         for name, pattern in [] if people else INTENTS:
             if name in generic_skip:
                 continue
@@ -824,10 +1185,14 @@ class Assistant:
         weak = [(i, s) for i, s in found if s > 1.0]
         steps.append(("Librarian", "BM25: " + (", ".join(f"{i} ({s:.1f})" for i, s in weak) or "nothing relevant")))
         in_scope = bool({stem(t) for t in raw_tokens(question)} & self.domain) or bool(codes)
+        dedicated = bool(facts)  # faits issus d'un calcul dédié, pas du mode interprétation
         if not facts and in_scope:
             # pas de calcul dédié : on donne au rédacteur les preuves proches et le contexte général
             weak = [(i, s) for i, s in weak if s > 2.5]
             facts += a.overview() + a.bottlenecks()[:2] + a.causes()[:1]
+            if self.writer.mode != "deterministic":
+                # avec un LLM : tous les indicateurs agrégés, il choisit ceux qui répondent
+                facts += a.topics(q, every=True)
             for i, _ in weak[:3]:
                 e = self.evidence[i]
                 body = re.sub(r"\.\s+(?=\S)", "; ", e.text.strip()).rstrip(".")
@@ -844,15 +1209,19 @@ class Assistant:
             if f.claim not in seen:
                 uniq.append(f)
                 seen.add(f.claim)
-        facts = uniq[:10]
+        facts = uniq[:24 if self.writer.mode != "deterministic" else 10]
         allowed = {i for f in facts for i in f.ids} | {i for i, _ in hits}
 
         draft = self.writer.write(question, facts, self.evidence)
         err = self.writer.last_error
         steps.append(("Writer", f"LLM unavailable ({err}), falling back to the template" if err else self.writer.mode))
         if draft.strip().upper().startswith(REFUSAL):
-            return self._refuse(question, draft.strip()[len(REFUSAL):].strip(" :.-") or "The writer considers the "
-                                "facts insufficient.", [], steps)
+            if not dedicated:
+                return self._refuse(question, draft.strip()[len(REFUSAL):].strip(" :.-") or "The writer considers "
+                                    "the facts insufficient.", [], steps)
+            # le LLM refuse alors que Python a calculé des faits qui répondent : on garde les faits
+            draft = self.writer.template(facts)
+            steps.append(("Writer", "LLM refused although computed facts exist, falling back to the template"))
         sentences = self.controller.check(draft, self.evidence, allowed)
         kept = [s for s in sentences if s.ok]
         steps.append(("Checker", f"{len(kept)}/{len(sentences)} sentences validated"))
@@ -865,6 +1234,37 @@ class Assistant:
             return self._refuse(question, "No sentence passed the evidence check.", [], steps, sentences)
         return Answer(question, " ".join(s.text for s in kept), False, sentences,
                       {i: self.evidence[i] for s in kept for i in s.ids if i in self.evidence}, steps, self.writer.mode)
+
+    def _computed(self, question: str, steps: list) -> list[Fact]:
+        """Question non prévue : le LLM écrit la requête, Python l'exécute, le résultat devient une preuve."""
+        prompt = QueryRunner.SYSTEM + "DataFrames:\n" + self.query.schema
+        user, error = f"Question: {question}", None
+        for _ in range(2):  # un second essai avec le message d'erreur
+            try:
+                expr = QueryRunner.clean(self.writer._call(user + (f"\nYour previous expression failed: {error}. "
+                                                                     "Fix it." if error else ""), prompt))
+            except Exception as exc:
+                steps.append(("Analyst", f"query planner unavailable ({type(exc).__name__})"))
+                return []
+            if not expr or expr.upper().startswith("NONE"):
+                steps.append(("Analyst", "LLM query planner: the tables cannot answer this question"))
+                return []
+            try:
+                value = self.query.run(expr)
+                text = QueryRunner.render(value)
+                if not text.strip():
+                    raise ValueError("empty result")
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"[:200]
+                steps.append(("Analyst", f"LLM-written query failed: {expr[:150]} ({error})"))
+                continue
+            self.query.n += 1
+            sid = f"STAT:query_{self.query.n}"
+            self.evidence[sid] = Evidence(sid, f"Python calculation on the actual data, expression `{expr}`: {text}.",
+                                          "Calculation on actual data (query written by the LLM)")
+            steps.append(("Analyst", f"LLM-written query run by Python: {expr}"))
+            return [Fact(f"Computed from the data for this question: {text}.", [sid])]
+        return []
 
     def _refuse(self, question, reason, ids, steps, sentences=None) -> Answer:
         text = f"{REFUSAL}. {reason}"
